@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+import socket 
+import ssl
+import os
+import termios
+import tty
+import sys
+import select
+import traceback
+import cmd
+import threading
+import array
+import fcntl
+import struct
+import signal
+
+
+clients       = []
+lock          = threading.RLock()
+ACCEPTLOOP    = True
+CERT          = "mcb.pem"
+
+class Client(object):
+    """ class that handle cb client """
+    def __init__(self, sslfd):
+        self._fd = sslfd
+        self.fileno = sslfd.fileno()
+        self.peername =  f"{self._fd.getpeername()[0]}:{self._fd.getpeername()[1]}"
+        self.sockname =  f"{self._fd.getsockname()[1]}:{self._fd.getsockname()[0]}"
+        self.interactive = False
+
+    def __del__(self):
+        try:
+            self._fd.shutdown(socket.SHUT_RDWR)
+            self._fd.close()
+        except OSError:
+            pass
+
+    def __str__(self):
+        return f"SSLPTY fd={self.fileno} {self.peername} => {self.sockname}"
+
+    def interactive_shell(self):
+        """get interactive pty from client"""
+        self.interactive = True
+        old = termios.tcgetattr(sys.stdin)
+        try:
+            tty.setcbreak(sys.stdin)
+            tty.setraw(sys.stdin)
+
+            def handle_winsize(sig,frame):
+                if sig == signal.SIGWINCH:
+                    a = array.array('H', [0, 0, 0, 0])
+                    fcntl.ioctl(0, termios.TIOCGWINSZ, a, True)
+                    resize = b"\x1d" + struct.pack(">HH",a[1],a[0])
+                    self._fd.send(resize)
+
+            signal.signal(signal.SIGWINCH, handle_winsize)
+
+            while self.interactive:
+
+                rs, ws, es = select.select([ sys.stdin, self._fd ], [], [])    
+                for r in rs:
+                    if r is sys.stdin:
+                        data =  r.buffer.raw.read(1024)
+                        if data.find(b"\x1d") != -1: # resize term
+                            continue
+                        if data.find(b"\x04") != -1: # detach session
+                            self.interactive = False
+                            sys.stdout.write( f"\r\nDetached from fd={self._fd.fileno()}\r\n")
+                            sys.stdout.flush() 
+                            continue
+                        self._fd.write( data )
+                    elif r is self._fd:
+                        data = r.read(1024)
+                        sys.stdout.buffer.write( data)
+                        sys.stdout.flush()
+ 
+        except (BrokenPipeError , ssl.SSLEOFError):
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+            print("EOF exit broken pipe")
+            clients.remove(self)
+
+        except Exception:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+            track = traceback.format_exc()
+            print(track)
+ 
+        finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+            sys.stdout.flush() 
+
+def setup_server( bindsocket, port ):
+    """ fonction that handle ssl server setup """
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain(CERT)
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.VerifyMode.CERT_NONE
+    
+    bindsocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    bindsocket.bind(('', port))
+    bindsocket.listen(1)
+    try:
+        while ACCEPTLOOP:
+            newsocket, _ = bindsocket.accept()
+            print(f"new connection from {_}")
+            sslsoc = ssl_ctx.wrap_socket(newsocket, server_side=True)
+            clients.append( Client(sslsoc) )
+    except OSError:
+        print("server socket down")
+    except Exception as exc:
+        track = traceback.format_exc()
+        print(track)
+        print(f"FATAL server error : {exc}")
+
+    finally:
+        try:
+            bindsocket.shutdown(socket.SHUT_RDWR)
+            bindsocket.close()
+        except OSError:
+            pass
+ 
+class MCB(cmd.Cmd):
+    """ multi connectback class that handle multiple SSL connectback with screen like attach/detach concept """
+    clients = []
+ 
+    def __init__(self, port):
+        super(MCB, self).__init__()
+        self.acceptsocket = socket.socket()
+        self.port = port
+        self.prompt = '(MCB) '
+        self.intro = 'MCB listening on %i'%port
+        self.serv = threading.Thread(target=setup_server,args=(self.acceptsocket, self.port))
+        self.serv.start()
+
+    def do_list(self,arg):
+        """list connected peers"""
+        l = len(clients)
+        for i in range(l):
+            print(i,clients[i])
+
+    def do_interact(self,arg):
+        """interact with pty on peer"""
+        try:
+            idx = int(arg)
+            c = clients[idx]
+            c.interactive_shell()
+        except (IndexError, ValueError) as _e:
+            print(f"problem with index {arg} :: {_e}")
+
+    def do_EOF(self,arg):
+        """handle EOF """
+        print()
+
+    def emptyline(self):
+        """emptyline """
+        pass
+
+    def do_exit(self,arg):
+        """exit MCB"""
+        ACCEPTLOOP = False
+        self.acceptsocket.shutdown(socket.SHUT_RDWR)
+        self.serv.join()
+        print("Exiting MCB")
+        sys.exit(0)
+
+if __name__ == '__main__':
+    PORT = -1
+
+    if not os.path.exists(CERT):
+        print(
+"""
+No certificate found for MCB
+Generate one with:
+
+openssl req -newkey rsa:4096 -nodes -keyout key.pem -x509 -days 365 -out cert.pem
+cat cert.pem key.pem > mcb.pem
+rm cert.pem key.pem
+""")
+        sys.exit(-1)
+    try:
+        PORT = int(sys.argv[1])
+    except ValueError:
+        print(f"{sys.argv[0]} <port>")
+        sys.exit(-1)
+
+    c = MCB(PORT)
+    while 1:
+        try:
+            c.cmdloop()
+        except KeyboardInterrupt:
+            print()
